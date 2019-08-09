@@ -1,15 +1,7 @@
-#include <ctype.h>
-#include <math.h>
-#include <stdio.h>
-#include <stdint.h>
-#include <stdlib.h>
-#include <string.h>
-#include <time.h>
-#include <algorithm>
-
 #include "2048.h"
 
-#include "config.h"
+using namespace std;
+
 #if defined(HAVE_UNORDERED_MAP)
     #include <unordered_map>
     typedef std::unordered_map<board_t, trans_table_entry_t> trans_table_t;
@@ -65,6 +57,28 @@ static int count_empty(board_t x)
     return x & 0xf;
 }
 
+void print_board(board_t board) {
+    int i,j;
+    for(i=0; i<4; i++) {
+        for(j=0; j<4; j++) {
+            uint8_t powerVal = (board) & 0xf;
+            printf("%6u", (powerVal == 0) ? 0 : 1 << powerVal);
+            board >>= 4;
+        }
+        printf("\n");
+    }
+    printf("\n");
+}
+
+static inline board_t unpack_col(row_t row) {
+    board_t tmp = row;
+    return (tmp | (tmp << 12ULL) | (tmp << 24ULL) | (tmp << 36ULL)) & COL_MASK;
+}
+
+static inline row_t reverse_row(row_t row) {
+    return (row >> 12) | ((row >> 4) & 0x00F0)  | ((row << 4) & 0x0F00) | (row << 12);
+}
+
 /* We can perform state lookups one row at a time by using arrays with 65536 entries. */
 
 /* Move tables. Each row or compressed column is mapped to (oldrow^newrow) assuming row/col 0.
@@ -86,6 +100,9 @@ static const float SCORE_SUM_POWER = 3.5f;
 static const float SCORE_SUM_WEIGHT = 11.0f;
 static const float SCORE_MERGES_WEIGHT = 700.0f;
 static const float SCORE_EMPTY_WEIGHT = 270.0f;
+static const int NB_RUNS_PER_MOVE = 1000;
+
+
 
 void init_tables() {
     for (unsigned row = 0; row < 65536; ++row) {
@@ -224,7 +241,7 @@ static inline board_t execute_move_3(board_t board) {
 }
 
 /* Execute a move. */
-static inline board_t execute_move(int move, board_t board) {
+board_t execute_move(int move, board_t board) {
     switch(move) {
     case 0: // up
         return execute_move_0(board);
@@ -268,26 +285,10 @@ static inline int count_distinct_tiles(board_t board) {
 
 /* Optimizing the game */
 
-struct eval_state {
-    trans_table_t trans_table; // transposition table, to cache previously-seen moves
-    int maxdepth;
-    int curdepth;
-    int cachehits;
-    unsigned long moves_evaled;
-    int depth_limit;
 
-    eval_state() : maxdepth(0), curdepth(0), cachehits(0), moves_evaled(0), depth_limit(0) {
-    }
-};
-
-// score a single board heuristically
-static float score_heur_board(board_t board);
 // score a single board actually (adding in the score from spawned 4 tiles)
-static float score_board(board_t board);
+
 // score over all possible moves
-static float score_move_node(eval_state &state, board_t board, float cprob);
-// score over all possible tile choices and placements
-static float score_tilechoose_node(eval_state &state, board_t board, float cprob);
 
 
 static float score_helper(board_t board, const float* table) {
@@ -297,12 +298,8 @@ static float score_helper(board_t board, const float* table) {
            table[(board >> 48) & ROW_MASK];
 }
 
-static float score_heur_board(board_t board) {
-    return score_helper(          board , heur_score_table) +
-           score_helper(transpose(board), heur_score_table);
-}
 
-static float score_board(board_t board) {
+float score_board(board_t board) {
     return score_helper(board, score_table);
 }
 
@@ -312,159 +309,14 @@ static float score_board(board_t board) {
 static const float CPROB_THRESH_BASE = 0.0001f;
 static const int CACHE_DEPTH_LIMIT  = 15;
 
-static float score_tilechoose_node(eval_state &state, board_t board, float cprob) {
-    if (cprob < CPROB_THRESH_BASE || state.curdepth >= state.depth_limit) {
-        state.maxdepth = std::max(state.curdepth, state.maxdepth);
-        return score_heur_board(board);
-    }
-    if (state.curdepth < CACHE_DEPTH_LIMIT) {
-        const trans_table_t::iterator &i = state.trans_table.find(board);
-        if (i != state.trans_table.end()) {
-            trans_table_entry_t entry = i->second;
-            /*
-            return heuristic from transposition table only if it means that
-            the node will have been evaluated to a minimum depth of state.depth_limit.
-            This will result in slightly fewer cache hits, but should not impact the
-            strength of the ai negatively.
-            */
-            if(entry.depth <= state.curdepth)
-            {
-                state.cachehits++;
-                return entry.heuristic;
-            }
-        }
-    }
 
-    int num_open = count_empty(board);
-    cprob /= num_open;
-
-    float res = 0.0f;
-    board_t tmp = board;
-    board_t tile_2 = 1;
-    while (tile_2) {
-        if ((tmp & 0xf) == 0) {
-            res += score_move_node(state, board |  tile_2      , cprob * 0.9f) * 0.9f;
-            res += score_move_node(state, board | (tile_2 << 1), cprob * 0.1f) * 0.1f;
-        }
-        tmp >>= 4;
-        tile_2 <<= 4;
-    }
-    res = res / num_open;
-
-    if (state.curdepth < CACHE_DEPTH_LIMIT) {
-        trans_table_entry_t entry = {static_cast<uint8_t>(state.curdepth), res};
-        state.trans_table[board] = entry;
-    }
-
-    return res;
-}
-
-static float score_move_node(eval_state &state, board_t board, float cprob) {
-    float best = 0.0f;
-    state.curdepth++;
-    for (int move = 0; move < 4; ++move) {
-        board_t newboard = execute_move(move, board);
-        state.moves_evaled++;
-
-        if (board != newboard) {
-            best = std::max(best, score_tilechoose_node(state, newboard, cprob));
-        }
-    }
-    state.curdepth--;
-
-    return best;
-}
-
-static float _score_toplevel_move(eval_state &state, board_t board, int move) {
-    //int maxrank = get_max_rank(board);
-    board_t newboard = execute_move(move, board);
-
-    if(board == newboard)
-        return 0;
-
-    return score_tilechoose_node(state, newboard, 1.0f) + 1e-6;
-}
-
-float score_toplevel_move(board_t board, int move) {
-    float res;
-    struct timeval start, finish;
-    double elapsed;
-    eval_state state;
-    state.depth_limit = std::max(3, count_distinct_tiles(board) - 2);
-
-    gettimeofday(&start, NULL);
-    res = _score_toplevel_move(state, board, move);
-    gettimeofday(&finish, NULL);
-
-    elapsed = (finish.tv_sec - start.tv_sec);
-    elapsed += (finish.tv_usec - start.tv_usec) / 1000000.0;
-
-    printf("Move %d: result %f: eval'd %ld moves (%d cache hits, %d cache size) in %.2f seconds (maxdepth=%d)\n", move, res,
-        state.moves_evaled, state.cachehits, (int)state.trans_table.size(), elapsed, state.maxdepth);
-
-    return res;
-}
-
-/* Find the best move for a given board. */
-int find_best_move(board_t board) {
-    int move;
-    float best = 0;
-    int bestmove = -1;
-
-    print_board(board);
-    printf("Current scores: heur %.0f, actual %.0f\n", score_heur_board(board), score_board(board));
-
-    for(move=0; move<4; move++) {
-        float res = score_toplevel_move(board, move);
-
-        if(res > best) {
-            best = res;
-            bestmove = move;
-        }
-    }
-
-    return bestmove;
-}
-
-int ask_for_move(board_t board) {
-    int move;
-    char validstr[5];
-    char *validpos = validstr;
-
-    print_board(board);
-
-    for(move=0; move<4; move++) {
-        if(execute_move(move, board) != board)
-            *validpos++ = "UDLR"[move];
-    }
-    *validpos = 0;
-    if(validpos == validstr)
-        return -1;
-
-    while(1) {
-        char movestr[64];
-        const char *allmoves = "UDLR";
-
-        printf("Move [%s]? ", validstr);
-
-        if(!fgets(movestr, sizeof(movestr)-1, stdin))
-            return -1;
-
-        if(!strchr(validstr, toupper(movestr[0]))) {
-            printf("Invalid move.\n");
-            continue;
-        }
-
-        return strchr(allmoves, toupper(movestr[0])) - allmoves;
-    }
-}
 
 /* Playing the game */
-static board_t draw_tile() {
+board_t draw_tile() {
     return (unif_random(10) < 9) ? 1 : 2;
 }
 
-static board_t insert_tile_rand(board_t board, board_t tile) {
+board_t insert_tile_rand(board_t board, board_t tile) {
     int index = unif_random(count_empty(board));
     board_t tmp = board;
     while (true) {
@@ -480,12 +332,12 @@ static board_t insert_tile_rand(board_t board, board_t tile) {
     return board | tile;
 }
 
-static board_t initial_board() {
+board_t initial_board() {
     board_t board = draw_tile() << (4 * unif_random(16));
     return insert_tile_rand(board, draw_tile());
 }
 
-void play_game(get_move_func_t get_move) {
+board_t play_game_get_board(get_move_func_t get_move) {
     board_t board = initial_board();
     int moveno = 0;
     int scorepenalty = 0; // "penalty" for obtaining free 4 tiles
@@ -501,7 +353,6 @@ void play_game(get_move_func_t get_move) {
         if(move == 4)
             break; // no legal moves
 
-        printf("\nMove #%d, current score=%.0f\n", ++moveno, score_board(board) - scorepenalty);
 
         move = get_move(board);
         if(move < 0)
@@ -517,13 +368,76 @@ void play_game(get_move_func_t get_move) {
         board_t tile = draw_tile();
         if (tile == 2) scorepenalty += 4;
         board = insert_tile_rand(newboard, tile);
+
     }
 
     print_board(board);
-    printf("\nGame over. Your score is %.0f. The highest rank you achieved was %d.\n", score_board(board) - scorepenalty, get_max_rank(board));
+    printf("\nGame over. Your score is %.0f. The highest rank you achieved was %d.\n", score_board(board) - 
+    scorepenalty, get_max_rank(board));
+    return board;
 }
 
-int main() {
-    init_tables();
-    play_game(find_best_move);
+template<typename T>
+void print_iterable(const T& v) {
+    std::copy(v.begin(), v.end(), std::ostream_iterator<typename T::value_type>(std::cout, ", "));
 }
+
+float get_std_vector(std::vector<float> & array) {
+    float mean = std::accumulate(array.begin(), array.end(), 0.0) / array.size();
+    float var = 0;
+    for(int it = 0; it<array.size(); it++){
+        var += (array[it] - mean) * (array[it] - mean);
+    }
+    float std = std::sqrt(var/array.size());
+    return std;
+}
+
+// map<int, float> get_counts(){
+//     count
+// }
+
+void print_max_tiles(vector<float> & max_tiles){
+    map<float, int> counter;
+    map<float, int>::iterator it;
+    for(int i=0; i< max_tiles.size(); i++){
+        float tile = max_tiles[i];
+        it = counter.find(tile);
+        if(it == counter.end()){
+            counter[tile] = 1;
+        }
+        else{
+            counter[tile]++;
+        }
+    }
+    int accumulate = 0;
+    for(it=counter.begin(); it!= counter.end(); it++){
+        accumulate += it->second;
+        cout<<it->first<<": "<<accumulate / max_tiles.size()<<", ";
+    }
+}
+
+
+void evaluate_multiple_games(get_move_func_t get_move, int nb_games){
+    std::vector<float> scores(nb_games);
+    std::vector<float> max_tiles(nb_games);
+    for(int i=0; i<nb_games; i++){
+        board_t end_board = play_game_get_board(get_move);
+        scores[i] = score_board(end_board);
+        max_tiles[i] = get_max_rank(end_board);
+        max_tiles[i] = std::pow(2,  max_tiles[i]);
+        std::cout<< i << " game done" << std::endl;
+    }
+    std::cout << "scores: ";
+    print_iterable(scores);
+    std::cout << std::endl;
+
+    std::cout << "max tiles: ";
+    print_iterable(max_tiles);
+    std::cout << std::endl;
+
+    std::cout << "mean score: " << std::accumulate( scores.begin(), scores.end(), 0.0) / scores.size() << std::endl;
+    print_max_tiles(max_tiles);
+    std::cout << "std score: " << get_std_vector(scores);
+    std::cout << std::endl;
+}
+
