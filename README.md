@@ -1,4 +1,6 @@
-AI for the [2048 game](http://gabrielecirulli.github.io/2048/). This uses *expectimax optimization*, along with a highly-efficient bitboard representation to search upwards of 10 million moves per second on recent hardware. Heuristics used include bonuses for empty squares and bonuses for placing large values near edges and corners. Read more about the algorithm on the [StackOverflow answer](https://stackoverflow.com/a/22498940/1204143).
+AI that uses monte carlo tree search to play 2048, it arrives consistenetly to the 4096 tile.
+
+TI only created the AI that makes decides the move to make, the rest of the code was forked from nneonneo.
 
 ## Building
 
