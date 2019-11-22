@@ -1,6 +1,6 @@
 AI that uses monte carlo tree search to play 2048, it arrives consistenetly to the 4096 tile.
 
-TI only created the AI that makes decides the move to make, the rest of the code was forked from nneonneo.
+I only created the AI that makes decides the move to make, the rest of the code was forked from nneonneo.
 
 ## Building
 
